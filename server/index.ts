@@ -86,20 +86,31 @@ app.post('/api/chat', async (req, res) => {
     sessionId,
     message.trim(),
 
-    // onTextDelta：每次 Claude 輸出一段文字時呼叫
-    // 我們把它包裝成 SSE 的 'delta' 事件送給前端
+    // onTextDelta：Claude 輸出文字時 → SSE 'delta' 事件
     (text) => {
       sendEvent('delta', { text })
     },
 
-    // onDone：Agent 迴圈完成時呼叫
+    // onCards：Claude 呼叫 show_mood_cards 工具時 → SSE 'cards' 事件
+    // 前端收到後會渲染牌卡選擇 UI
+    (cardEvent) => {
+      sendEvent('cards', cardEvent)
+    },
+
+    // onMeditation：Claude 呼叫 show_meditation 工具時 → SSE 'meditation' 事件
+    // 前端收到後會渲染冥想引導元件（呼吸動畫、計時器、引導文字）
+    (meditationEvent) => {
+      sendEvent('meditation', meditationEvent)
+    },
+
+    // onDone：Agent 迴圈完成時
     () => {
       sendEvent('done', { status: 'complete' })
-      res.end() // 關閉 SSE 連線
+      res.end()
       console.log(`[Chat] Session ${sessionId.slice(0, 8)}... 回覆完成`)
     },
 
-    // onError：發生錯誤時呼叫
+    // onError：發生錯誤時
     (err) => {
       console.error(`[Chat] 錯誤:`, err.message)
       sendEvent('error', { message: err.message })

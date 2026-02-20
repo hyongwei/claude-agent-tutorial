@@ -236,14 +236,200 @@ export const memoryTool = betaMemoryTool(memoryHandlers)
 export { FileSystemMemoryHandlers }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Skills 架構說明
+//
+// 正確的 Skill 架構 = 工具（Tool） + 技能協議檔案（SKILL.md）
+//
+// 【之前的做法（錯誤）】
+//   把完整的技能協議（啟動流程、解讀框架、應對策略）寫在 COUNSELOR_SYSTEM_PROMPT
+//   → 每次對話都載入，不管需不需要
+//   → System Prompt 臃腫，難以維護
+//
+// 【正確的做法（Skills 架構）】
+//   System Prompt：只放技能的 metadata（名稱、描述、啟動時機）— 約 30 tokens
+//   SKILL.md 檔案：完整的技能協議（存放於 server/skills/<skill-name>/SKILL.md）
+//   read_skill 工具：Claude 判斷需要某技能時，呼叫此工具動態載入完整協議
+//
+// 工具分工：
+//   read_skill       — 知識工具：動態載入 SKILL.md 的完整互動協議
+//   show_mood_cards  — UI 工具：觸發前端渲染牌卡選擇介面（透過 SSE）
+//   show_meditation  — UI 工具：觸發前端渲染冥想引導元件（透過 SSE）
+// ─────────────────────────────────────────────────────────────────────────────
+
+// SKILLS_DIR：技能檔案的存放根目錄
+const SKILLS_DIR = path.resolve('./server/skills')
+
+// readSkillTool：動態技能載入工具
+// 當 Claude 根據對話情境判斷需要使用某技能時，先呼叫此工具載入完整協議，
+// 再按照協議執行。這對應官方 Skills 架構中 Claude 讀取 SKILL.md 的機制。
+const readSkillTool = {
+  name: 'read_skill',
+  description: `載入指定技能的完整互動協議（SKILL.md）。
+使用時機：當你根據對話情境判斷應啟動某項技能時，先呼叫此工具取得完整協議，再按照協議執行。
+重要：必須先讀取技能協議，再執行技能的任何步驟。`,
+  input_schema: {
+    type: 'object' as const,
+    properties: {
+      skill_name: {
+        type: 'string',
+        description: '技能名稱，對應 server/skills/ 目錄下的資料夾名稱',
+        enum: ['mood-awareness-cards', 'meditation-guide'],
+      },
+    },
+    required: ['skill_name'],
+  },
+  run: async (input: unknown) => {
+    const { skill_name } = input as { skill_name: string }
+    const skillPath = path.join(SKILLS_DIR, skill_name, 'SKILL.md')
+    try {
+      const content = await fs.readFile(skillPath, 'utf-8')
+      console.log(`[Skill] 載入技能協議: ${skill_name}`)
+      return content
+    } catch {
+      return `錯誤：找不到技能 "${skill_name}" 的協議檔案（路徑：${skillPath}）`
+    }
+  },
+}
+
+// ── 冥想引導技能型別 ──────────────────────────────────────────────────────────
+
+export interface MeditationBreathing {
+  inhale_seconds: number  // 吸氣秒數
+  hold_seconds: number    // 屏氣秒數（0 = 略過）
+  exhale_seconds: number  // 呼氣秒數
+  rest_seconds: number    // 休息秒數（0 = 略過）
+}
+
+export interface MeditationEvent {
+  title: string                  // 冥想主題，例如「正念呼吸」「焦慮舒緩」
+  guidance: string               // 開場引導語（2-3 句，根據對話情境定制）
+  duration_minutes: number       // 建議冥想時長（分鐘）
+  breathing: MeditationBreathing // 呼吸節奏
+}
+
+// ── 牌卡技能型別 ──────────────────────────────────────────────────────────────
+
+export interface MoodCard {
+  id: string
+  name: string         // 繁體中文名稱，例如「平靜」
+  english_name: string // 英文名稱，例如「Calm」
+  symbol: string       // Emoji，例如「🌊」
+  color_theme: string  // 色彩主題，對應前端的 gradient mapping
+  description: string  // 1-2 句繁體中文描述
+}
+
+export interface CardEvent {
+  prompt: string    // Claude 的邀請語，例如「請選擇一張最能代表你現在心情的牌卡」
+  cards: MoodCard[] // 4-6 張牌卡
+}
+
+function createMoodCardsTool(onCards: (event: CardEvent) => void) {
+  return {
+    name: 'show_mood_cards',
+    // description 只描述 UI 機制，不包含技能知識
+    // 完整的技能協議（何時啟動、如何引導、如何解讀、如何應對）在 SKILL.md 中
+    // Claude 必須先呼叫 read_skill("mood-awareness-cards") 才能使用此工具
+    description: `心情覺察牌卡的 UI 工具 — 觸發前端顯示牌卡選擇介面。
+前提：必須已呼叫 read_skill("mood-awareness-cards") 載入技能協議。
+呼叫後請勿輸出任何文字，靜待用戶選擇。`,
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        prompt: {
+          type: 'string',
+          description: '邀請用戶選牌的溫暖引導語（繁體中文）',
+        },
+        cards: {
+          type: 'array',
+          description: '要顯示的牌卡，選 4-6 張與當前話題最相關的',
+          minItems: 4,
+          maxItems: 6,
+          items: {
+            type: 'object',
+            properties: {
+              id: { type: 'string' },
+              name: { type: 'string', description: '繁體中文名稱' },
+              english_name: { type: 'string' },
+              symbol: { type: 'string', description: 'Emoji 符號' },
+              color_theme: {
+                type: 'string',
+                enum: ['ocean', 'sunrise', 'forest', 'sunshine', 'blossom', 'mountain', 'lavender', 'moonlight'],
+                description: '對應的色彩主題',
+              },
+              description: { type: 'string', description: '1-2 句繁體中文的直覺感受描述' },
+            },
+            required: ['id', 'name', 'english_name', 'symbol', 'color_theme', 'description'],
+          },
+        },
+      },
+      required: ['prompt', 'cards'],
+    },
+    // run 函數：Claude 呼叫工具時，toolRunner 自動執行這個函數
+    // 透過 closure 存取外部的 onCards callback，
+    // 把牌卡資料傳出去（最終透過 SSE 送到前端）
+    run: async (input: unknown) => {
+      onCards(input as CardEvent)
+      return '心情覺察牌卡已顯示給用戶。請靜待用戶選擇，不需輸出任何文字。'
+    },
+  }
+}
+
+// createMeditationTool：冥想引導 UI 工具工廠
+// 觸發前端渲染冥想引導元件（呼吸動畫、計時器、引導文字）
+// 必須先呼叫 read_skill("meditation-guide") 載入完整協議再使用
+function createMeditationTool(onMeditation: (event: MeditationEvent) => void) {
+  return {
+    name: 'show_meditation',
+    description: `冥想引導的 UI 工具 — 觸發前端顯示冥想引導元件（呼吸動畫、計時器、引導文字）。
+前提：必須已呼叫 read_skill("meditation-guide") 載入技能協議。
+呼叫後請勿輸出任何文字，讓用戶進入冥想狀態。`,
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        title: {
+          type: 'string',
+          description: '冥想主題，例如「正念呼吸」「焦慮舒緩」「深度放鬆」',
+        },
+        guidance: {
+          type: 'string',
+          description: '個性化的開場引導語（2-3 句，根據用戶當前狀態定制，語氣溫柔平靜）',
+        },
+        duration_minutes: {
+          type: 'number',
+          description: '建議冥想時長（分鐘），通常 3-10 分鐘',
+          minimum: 1,
+          maximum: 30,
+        },
+        breathing: {
+          type: 'object',
+          description: '呼吸節奏設定',
+          properties: {
+            inhale_seconds:  { type: 'number', description: '吸氣秒數', minimum: 2, maximum: 10 },
+            hold_seconds:    { type: 'number', description: '屏氣秒數，0 表示略過', minimum: 0, maximum: 10 },
+            exhale_seconds:  { type: 'number', description: '呼氣秒數', minimum: 2, maximum: 10 },
+            rest_seconds:    { type: 'number', description: '休息秒數，0 表示略過', minimum: 0, maximum: 10 },
+          },
+          required: ['inhale_seconds', 'hold_seconds', 'exhale_seconds', 'rest_seconds'],
+        },
+      },
+      required: ['title', 'guidance', 'duration_minutes', 'breathing'],
+    },
+    run: async (input: unknown) => {
+      onMeditation(input as MeditationEvent)
+      return '冥想引導元件已顯示給用戶。請靜待用戶完成冥想，不需輸出任何文字。'
+    },
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // 心理諮詢 System Prompt
 //
-// System Prompt 是告訴 Claude「你是誰、你要做什麼」的指令。
-// 這裡我們定義：
-//   1. 諮詢師角色和方法論（CBT）
-//   2. 如何使用記憶工具（存什麼、存在哪裡）
-//   3. 危機處理流程
-//   4. 專業界限
+// System Prompt 的設計原則（Skills 架構）：
+//   ✅ 放在這裡：角色定義、CBT 方法論、記憶指示、危機處理、Skills Registry
+//   ❌ 不放這裡：技能的完整協議（改放 SKILL.md，由 read_skill 工具動態載入）
+//
+// Skills Registry 只包含：技能名稱、一句話描述、啟動時機關鍵字
+// 完整的技能知識（解讀框架、應對策略、詳細流程）由 Claude 按需載入
 // ─────────────────────────────────────────────────────────────────────────────
 
 export const COUNSELOR_SYSTEM_PROMPT = `
@@ -314,6 +500,16 @@ You are a warm, compassionate psychological counseling assistant trained in Cogn
 - 定期提醒用戶可以並鼓勵尋求專業幫助
 - 不要診斷任何精神健康狀況
 - 在保持溫暖的同時維持適當的專業界限
+
+## 可用技能（Skills Registry）
+
+以下技能的完整協議存放於獨立的 SKILL.md 檔案中。
+**使用任何技能前，必須先呼叫 \`read_skill\` 工具載入完整協議，再按協議執行。**
+
+| 技能名稱 | 說明 | 建議啟動時機 |
+|---------|------|------------|
+| mood-awareness-cards | 心情覺察牌卡 — 透過直覺式視覺選擇幫助接觸深層情緒 | 用戶難以言語化情緒（說不清楚/很複雜/不知道）；對話開始的暖身；對話陷入瓶頸；用戶過度理智化 |
+| meditation-guide | 冥想引導 — 結構化呼吸練習幫助放鬆、減壓、穩定身心 | 用戶說「太緊張」「好焦慮」「需要放鬆」「想冥想」；情緒激動需先穩定；明確要求呼吸練習 |
 `.trim()
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -335,6 +531,8 @@ export async function streamCounselorResponse(
   sessionId: string,
   userMessage: string,
   onTextDelta: (text: string) => void,
+  onCards: (event: CardEvent) => void,
+  onMeditation: (event: MeditationEvent) => void,
   onDone: () => void,
   onError: (err: Error) => void
 ): Promise<void> {
@@ -363,10 +561,14 @@ export async function streamCounselorResponse(
     //
     // 注意：runner.on('text', ...) 是 Python SDK 的寫法，TypeScript 不支援
     const runner = anthropic.beta.messages.toolRunner({
-      model: 'claude-sonnet-4-6',
+      model: 'claude-haiku-4-5-20251001',
       max_tokens: 4096,
       system: COUNSELOR_SYSTEM_PROMPT,
-      tools: [memoryTool],
+      // 工具列表：
+      //   memoryTool          — 長期記憶讀寫（永久載入）
+      //   readSkillTool       — 技能協議動態載入（永久載入，但協議內容按需讀取）
+      //   createMoodCardsTool — 牌卡 UI 觸發（永久載入，但必須先讀取技能協議才使用）
+      tools: [memoryTool, readSkillTool, createMoodCardsTool(onCards), createMeditationTool(onMeditation)],
       betas: ['context-management-2025-06-27'],
       messages,
       max_iterations: 10,

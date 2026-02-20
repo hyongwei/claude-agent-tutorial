@@ -3,7 +3,9 @@
     "allow": [
       "Bash(npm create:*)",
       "Bash(npm install:*)",
-      "Bash(npx tailwindcss:*)"
+      "Bash(npx tailwindcss:*)",
+      "Skill(claude-developer-platform)",
+      "WebSearch"
     ]
   }
 }
